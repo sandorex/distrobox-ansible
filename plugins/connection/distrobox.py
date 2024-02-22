@@ -22,6 +22,16 @@ DOCUMENTATION = '''
           - name: ansible_host
           - name: inventory_hostname
           - name: ansible_distrobox_host
+      remote_user:
+        description:
+            - User specified via name which is used to execute commands inside the container.
+        ini:
+          - section: defaults
+            key: remote_user
+        env:
+          - name: ANSIBLE_REMOTE_USER
+        vars:
+          - name: ansible_user
       podman_executable:
         description:
           - Executable for podman command.
@@ -41,6 +51,7 @@ DOCUMENTATION = '''
 '''
 
 import subprocess
+import base64
 
 from ansible.module_utils.common.process import get_bin_path
 from ansible.errors import AnsibleError
@@ -64,9 +75,11 @@ class Connection(ConnectionBase):
         super(Connection, self).__init__(play_context, new_stdin, *args, **kwargs)
 
         self._container_id = self._play_context.remote_addr
+        self.user = self._play_context.remote_user
         self._connected = False
         display.vvvv("Using distrobox connection")
 
+    # TODO remove the need for podman so it could work with all container managers
     def _podman(self, subcommand: str, args=None, in_data=None):
         """
         run podman executable
@@ -142,8 +155,11 @@ class Connection(ConnectionBase):
     def exec_command(self, cmd, in_data=None, sudoable=True):
         super(Connection, self).exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # NOTE: it must run as root otherwise permissions are messed up and it fails
-        rc, stdout, stderr = self._distrobox_exec(cmd, distrobox_args=['-a', '--user=root'])
+        # distrobox parsing is weird, prevent problems im encoding the command in base64
+        cmd_base64 = base64.b64encode(cmd.encode('utf-8')).decode('utf-8')
+        rc, stdout, stderr = self._distrobox_exec(
+            'echo %s | base64 -d | sh' % (cmd_base64),
+            distrobox_args=['-a', '--user=' + (self.user if self.user else 'root')])
 
         display.vvvvv("STDOUT %r STDERR %r" % (stderr, stderr))
         return rc, stdout, stderr
@@ -160,6 +176,14 @@ class Connection(ConnectionBase):
                     in_path, out_path, self._container_id, stderr)
             )
 
+        if self.user:
+            rc, stdout, stderr = self._podman("exec", [self._container_id, "chown", self.user, out_path])
+            if rc != 0:
+                raise AnsibleError(
+                    "Failed to chown file %s for user %s in container %s\n%s" % (
+                        out_path, self.user, self._container_id, stderr)
+                )
+
     def fetch_file(self, in_path, out_path):
         """ obtain file specified via 'in_path' from the container and place it at 'out_path' """
         super(Connection, self).fetch_file(in_path, out_path)
@@ -173,7 +197,7 @@ class Connection(ConnectionBase):
 
     def _connect(self):
         """
-        there is no literal connection, but start the container now cause it seems better
+        there is no literal connection
         """
         super(Connection, self)._connect()
         self._connected = True
