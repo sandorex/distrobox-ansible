@@ -10,9 +10,9 @@ __metaclass__ = type
 DOCUMENTATION = '''
     author: Aleksandar Radivojevic (@sandorex)
     name: distrobox
-    short_description: Run playbooks in distrobox containers
+    short_description: Execute plays on distrobox containers as hosts
     description:
-        - Run commands or put/fetch files to an existing distrobox container.
+        - Run commands or push/fetch files to existing distrobox container.
     options:
       remote_addr:
         description:
@@ -51,7 +51,6 @@ DOCUMENTATION = '''
 '''
 
 import subprocess
-import base64
 
 from ansible.module_utils.common.process import get_bin_path
 from ansible.errors import AnsibleError
@@ -63,10 +62,8 @@ display = Display()
 
 # this _has to be_ named Connection
 class Connection(ConnectionBase):
-    """
-    TODO
-    """
-    # String used to identify this Connection class from other classes
+    """Connection plugin that works on a distrobox container"""
+
     transport = 'sandorex.distrobox.distrobox'
 
     has_pipelining = False
@@ -79,7 +76,7 @@ class Connection(ConnectionBase):
         self._connected = False
         display.vvvv("Using distrobox connection")
 
-    # TODO remove the need for podman so it could work with all container managers
+    # TODO make it generic so any container manager can work
     def _podman(self, subcommand: str, args=None, in_data=None):
         """
         run podman executable
@@ -120,9 +117,7 @@ class Connection(ConnectionBase):
         return p.returncode, stdout, stderr
 
     def _distrobox(self, subcommand, args=[], in_data=None):
-        """
-        TODO
-        """
+        """Runs distrobox command"""
         distrobox_exec = self.get_option('distrobox_executable')
 
         try:
@@ -149,16 +144,22 @@ class Connection(ConnectionBase):
         return p.returncode, stdout, stderr
 
     def _distrobox_exec(self, cmd, distrobox_args=[]):
-        return self._distrobox('enter', ['--name', self._container_id] + distrobox_args + ['--', cmd])
+        """Runs distrobox-enter to execute command inside a container with proper distrobox env"""
+        # NOTE: i added bash -l -c as the su parses the arguments weirdly
+        args = [
+            '-a',
+            '--user=' + (self.user if self.user else 'root'),
+            '--name', self._container_id
+        ] + distrobox_args + ['--', 'bash', '-l', '-c', cmd]
+
+        return self._distrobox('enter', args)
 
     @ensure_connect
     def exec_command(self, cmd, in_data=None, sudoable=True):
         super(Connection, self).exec_command(cmd, in_data=in_data, sudoable=sudoable)
 
-        # distrobox parsing is weird, prevent problems im encoding the command in base64
-        cmd_base64 = base64.b64encode(cmd.encode('utf-8')).decode('utf-8')
         rc, stdout, stderr = self._distrobox_exec(
-            'echo %s | base64 -d | sh' % (cmd_base64),
+            cmd,
             distrobox_args=['-a', '--user=' + (self.user if self.user else 'root')])
 
         display.vvvvv("STDOUT %r STDERR %r" % (stderr, stderr))
@@ -176,6 +177,7 @@ class Connection(ConnectionBase):
                     in_path, out_path, self._container_id, stderr)
             )
 
+        # if running as user chown the file
         if self.user:
             rc, stdout, stderr = self._podman("exec", [self._container_id, "chown", self.user, out_path])
             if rc != 0:
